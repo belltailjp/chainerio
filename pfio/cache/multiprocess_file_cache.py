@@ -1,6 +1,7 @@
 import errno
 import fcntl
 import os
+import shutil
 import tempfile
 import warnings
 
@@ -135,7 +136,8 @@ class MultiprocessFileCache(cache.Cache):
         self.length = length
         self.do_pickle = do_pickle
         self.verbose = verbose
-        assert self.length > 0
+        if self.length <= 0 or (2 ** 64) <= self.length:
+            raise ValueError("length has to be between 0 and 2^64")
 
         if dir is None:
             self.dir = _DEFAULT_CACHE_PATH
@@ -146,24 +148,22 @@ class MultiprocessFileCache(cache.Cache):
         self.closed = False
         self._frozen = False
         self._master_pid = os.getpid()
-        self.data_file = _NoOpenNamedTemporaryFile(self.dir, self._master_pid)
-        self.index_file = _NoOpenNamedTemporaryFile(self.dir, self._master_pid)
-        index_fd = os.open(self.index_file.name, os.O_RDWR)
+        self.cache_file = _NoOpenNamedTemporaryFile(self.dir, self._master_pid)
+        cache_fd = os.open(self.cache_file.name, os.O_RDWR)
 
         if self.verbose:
-            print('created index file:', self.index_file.name)
-            print('created data file:', self.data_file.name)
+            print('created cache file:', self.cache_file.name)
 
         try:
-            fcntl.flock(index_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(cache_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-            # Fill up index file by index=0, size=-1
+            # Fill up indices part of the cache file by index=0, size=-1
             buf = pack('Qq', 0, -1)
             self.buflen = calcsize('Qq')
             assert self.buflen == 16
             for i in range(self.length):
                 offset = self.buflen * i
-                r = os.pwrite(index_fd, buf, offset)
+                r = os.pwrite(cache_fd, buf, offset)
                 assert r == self.buflen
         except OSError as ose:
             # Lock acquisition error -> No problem, since other worker
@@ -171,13 +171,12 @@ class MultiprocessFileCache(cache.Cache):
             if ose.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
         finally:
-            fcntl.flock(index_fd, fcntl.LOCK_UN)
-            os.close(index_fd)
+            fcntl.flock(cache_fd, fcntl.LOCK_UN)
+            os.close(cache_fd)
 
         # Open lazily at the first call of get or put in each child process
         self._fd_pid = None
-        self.index_fd = None
-        self.data_fd = None
+        self.cache_fd = None
 
     def __len__(self):
         return self.length
@@ -202,24 +201,23 @@ class MultiprocessFileCache(cache.Cache):
         pid = os.getpid()
         if self._fd_pid != pid:
             self._fd_pid = pid
-            self.index_fd = os.open(self.index_file.name, os.O_RDWR)
-            self.data_fd = os.open(self.data_file.name, os.O_RDWR)
+            self.cache_fd = os.open(self.cache_file.name, os.O_RDWR)
 
     def _get(self, i):
         assert 0 <= i < self.length
 
         self._open_fds()
         offset = self.buflen * i
-        fcntl.flock(self.index_fd, fcntl.LOCK_SH)
-        index_entry = os.pread(self.index_fd, self.buflen, offset)
+        fcntl.flock(self.cache_fd, fcntl.LOCK_SH)
+        index_entry = os.pread(self.cache_fd, self.buflen, offset)
         (o, l) = unpack('Qq', index_entry)
         if l < 0 or o < 0:
-            fcntl.flock(self.index_fd, fcntl.LOCK_UN)
+            fcntl.flock(self.cache_fd, fcntl.LOCK_UN)
             return None
 
-        data = os.pread(self.data_fd, l, o)
+        data = os.pread(self.cache_fd, l, o)
         assert len(data) == l
-        fcntl.flock(self.index_fd, fcntl.LOCK_UN)
+        fcntl.flock(self.cache_fd, fcntl.LOCK_UN)
         return data
 
     def put(self, i, data):
@@ -246,22 +244,21 @@ class MultiprocessFileCache(cache.Cache):
 
         self._open_fds()
         index_ofst = self.buflen * i
-        fcntl.flock(self.index_fd, fcntl.LOCK_EX)
-        buf = os.pread(self.index_fd, self.buflen, index_ofst)
+        fcntl.flock(self.cache_fd, fcntl.LOCK_EX)
+        buf = os.pread(self.cache_fd, self.buflen, index_ofst)
         (o, l) = unpack('Qq', buf)
 
         if l >= 0 and o >= 0:
             # Already data exists
-            fcntl.flock(self.index_fd, fcntl.LOCK_UN)
+            fcntl.flock(self.cache_fd, fcntl.LOCK_UN)
             return False
 
-        data_pos = os.lseek(self.data_fd, 0, os.SEEK_END)
+        data_pos = os.lseek(self.cache_fd, 0, os.SEEK_END)
         index_entry = pack('Qq', data_pos, len(data))
-        assert os.pwrite(self.index_fd, index_entry, index_ofst) == self.buflen
-        assert os.pwrite(self.data_fd, data, data_pos) == len(data)
-        os.fsync(self.index_fd)
-        os.fsync(self.data_fd)
-        fcntl.flock(self.index_fd, fcntl.LOCK_UN)
+        assert os.pwrite(self.cache_fd, index_entry, index_ofst) == self.buflen
+        assert os.pwrite(self.cache_fd, data, data_pos) == len(data)
+        os.fsync(self.cache_fd)
+        fcntl.flock(self.cache_fd, fcntl.LOCK_UN)
         return True
 
     def __enter__(self):
@@ -274,18 +271,14 @@ class MultiprocessFileCache(cache.Cache):
         pid = os.getpid()
 
         if pid == self._fd_pid:
-            os.close(self.data_fd)
-            os.close(self.index_fd)
+            os.close(self.cache_fd)
             self._fd_pid = None
 
         if not self.closed and pid == self._master_pid:
-            self.data_file.close()
-            self.index_file.close()
+            self.cache_file.close()
             self.closed = True
-            self.data_file = None
-            self.index_file = None
-            self.data_fd = None
-            self.index_fd = None
+            self.cache_file = None
+            self.cache_fd = None
 
     def preload(self, name):
         '''Load the cache saved by ``preserve()``
@@ -313,24 +306,19 @@ class MultiprocessFileCache(cache.Cache):
         if self._master_pid != os.getpid():
             raise RuntimeError("Cannot preload a cache in a worker process")
 
+        if not os.path.exists(name):
+            if self.verbose:
+                print('Failed to ploread the cache from {}: '
+                      'The specified cache not found'
+                      .format(name))
+            return False
+
         # Overwrite the current cache by the specified cache file.
         # This is needed to prevent the specified cache files are deleted when
         # the cache object is destroyed.
-        ld_index_file = os.path.join(self.dir, '{}.cachei'.format(name))
-        ld_data_file = os.path.join(self.dir, '{}.cached'.format(name))
-        if any(not os.path.exists(p) for p in (ld_index_file, ld_data_file)):
-            if self.verbose:
-                print('Failed to ploread the cache from {}: '
-                      'The specified cache not found in {}'
-                      .format(name, self.dir))
-            return False
-
-        self.data_file.close()
-        self.index_file.close()
-        self.data_fd = None
-        self.index_fd = None
-        self.data_file = _DummyTemporaryFile(ld_data_file)
-        self.index_file = _DummyTemporaryFile(ld_index_file)
+        self.cache_file.close()
+        self.cache_fd = None
+        self.cache_file = _DummyTemporaryFile(name)
         self._frozen = True
         return True
 
@@ -359,26 +347,27 @@ class MultiprocessFileCache(cache.Cache):
         if self._master_pid != os.getpid():
             raise RuntimeError("Cannot preserve a cache in a worker process")
 
-        index_file = os.path.join(self.dir, '{}.cachei'.format(name))
-        data_file = os.path.join(self.dir, '{}.cached'.format(name))
-
-        if any(os.path.exists(p) for p in (index_file, data_file)):
+        if os.path.exists(name):
             if self.verbose:
-                print('Specified cache named "{}" already exists in {}'
-                      .format(name, self.dir))
+                print('Specified cache named "{}" already exists'
+                      .format(name))
             return False
 
         self._open_fds()
         try:
-            fcntl.flock(self.index_fd, fcntl.LOCK_EX)
-            os.link(self.index_file.name, index_file)
-            os.link(self.data_file.name, data_file)
+            fcntl.flock(self.cache_fd, fcntl.LOCK_EX)
+            os.link(self.cache_file.name, name)
 
         except OSError as ose:
+            if ose.errno in (errno.EPERM, errno.EXDEV):
+                # Hard link operation not permitted or cross device error
+                # -> fallback to copy
+                shutil.copyfile(self.cache_file.name, name)
+
             # Lock acquisition error -> No problem, since other worker
             # should be already working on it
-            if ose.errno not in (errno.EACCES, errno.EAGAIN):
+            elif ose.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
         finally:
-            fcntl.flock(self.index_fd, fcntl.LOCK_UN)
+            fcntl.flock(self.cache_fd, fcntl.LOCK_UN)
         return True

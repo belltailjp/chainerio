@@ -28,7 +28,7 @@ def test_cleanup():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert len(os.listdir(d)) == 2
+        assert len(os.listdir(d)) == 1
 
         cache.close()
 
@@ -47,7 +47,7 @@ def test_cleanup_subprocess():
 
         # Calling close in the subprocess should not
         # delete the cache files
-        assert len(os.listdir(d)) == 2
+        assert len(os.listdir(d)) == 1
 
         cache.close()
 
@@ -96,14 +96,14 @@ def test_preservation():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert cache.preserve('preserved') is True
+        assert cache.preserve(os.path.join(d, 'preserved')) is True
 
         cache.close()
 
         # Imitating a new process, fresh load
         cache2 = MultiprocessFileCache(10, dir=d, do_pickle=True)
 
-        assert cache2.preload('preserved') is True
+        assert cache2.preload(os.path.join('preserved')) is True
         for i in range(10):
             assert str(i) == cache2.get(i)
 
@@ -111,7 +111,7 @@ def test_preservation():
 
         # No temporary cache file should remain,
         # and the preserved cache should be kept.
-        assert os.listdir(d) == ['preserved.cached', 'preserved.cachei']
+        assert os.listdir(d) == ['preserved']
 
 
 def test_preservation_interoperability():
@@ -121,13 +121,13 @@ def test_preservation_interoperability():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert cache.preserve('preserved') is True
+        assert cache.preserve(os.path.join(d, 'preserved')) is True
 
         cache.close()
 
         cache2 = FileCache(10, dir=d, do_pickle=True)
 
-        assert cache2.preload('preserved') is True
+        assert cache2.preload(os.path.join('preserved')) is True
         for i in range(10):
             assert str(i) == cache2.get(i)
 
@@ -141,9 +141,9 @@ def test_preservation_error_already_exists():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert cache.preserve('preserved') is True
+        assert cache.preserve(os.path.join(d, 'preserved')) is True
 
-        assert cache.preserve('preserved') is False
+        assert cache.preserve(os.path.join(d, 'preserved')) is False
 
         cache.close()
 
@@ -179,7 +179,7 @@ def test_preload_error_not_found():
     with tempfile.TemporaryDirectory() as d:
         cache = MultiprocessFileCache(10, dir=d, do_pickle=True)
 
-        assert cache.preload('preserved') is False
+        assert cache.preload(os.path.join(d, 'preserved')) is False
 
         cache.close()
 
