@@ -58,7 +58,7 @@ class _DummyTemporaryFile(object):
 class MultiprocessFileCache(cache.Cache):
     '''The Multiprocess-safe cache system on a local filesystem
 
-    Stores cache data in local temporary files, created in ``~/.pfio/cache``
+    Stores cache data in a local temporary file, created in ``~/.pfio/cache``
     by default. It automatically deletes the cache data after the object is
     collected. When this object is not correctly closed (e.g., the process
     killed by SIGKILL), the cache remains after the process's death.
@@ -66,8 +66,8 @@ class MultiprocessFileCache(cache.Cache):
     This class supports handling a cache from multiple processes.
     A MultiprocessFileCache object can be handed over to another process
     through the pickle. Calling ``get`` and ``put`` in each process will
-    look into the same cache files with flock-based locking. The temporary
-    cache files will persist as long as the MultiprocessFileCache object is
+    look into the same cache file with flock-based locking. The temporary
+    cache file will persist as long as the MultiprocessFileCache object is
     alive in the original process that creates it.
     Therefore, even after destroying the worker processes,
     the MultiprocessFileCache object can still be passed to another process.
@@ -114,7 +114,7 @@ class MultiprocessFileCache(cache.Cache):
        i.e., ``num_workers=0`` in DataLoader, consider using :class:`~FileCache`
        as it has less overhead for concurrency control.
 
-       The persisted cache files created by ``preserve()`` can be used for
+       The persisted cache file created by ``preserve()`` can be used for
        :meth:`FileCache.preload` and vice versa.
 
     Arguments:
@@ -280,11 +280,11 @@ class MultiprocessFileCache(cache.Cache):
             self.cache_file = None
             self.cache_fd = None
 
-    def preload(self, name):
+    def preload(self, cache_path):
         '''Load the cache saved by ``preserve()``
 
-        After loading the files, no data can be added to the cache.
-        ``name`` is the prefix of the persistent files.
+        After loading the file, no data can be added to the cache.
+        ``cache_path`` is the path to the persistent file.
 
         Be noted that ``preload()`` can be called only by the master process
         i.e., the process where ``__init__()`` is called,
@@ -300,36 +300,35 @@ class MultiprocessFileCache(cache.Cache):
             if self.verbose:
                 print("Failed to preload the cache from {}: "
                       "The cache is already frozen."
-                      .format(name))
+                      .format(cache_path))
             return False
 
         if self._master_pid != os.getpid():
             raise RuntimeError("Cannot preload a cache in a worker process")
 
-        if not os.path.exists(name):
+        if not os.path.exists(cache_path):
             if self.verbose:
                 print('Failed to ploread the cache from {}: '
                       'The specified cache not found'
-                      .format(name))
+                      .format(cache_path))
             return False
 
         # Overwrite the current cache by the specified cache file.
-        # This is needed to prevent the specified cache files are deleted when
+        # This is needed to prevent the specified cache file are deleted when
         # the cache object is destroyed.
         self.cache_file.close()
         self.cache_fd = None
-        self.cache_file = _DummyTemporaryFile(name)
+        self.cache_file = _DummyTemporaryFile(cache_path)
         self._frozen = True
         return True
 
-    def preserve(self, name):
-        '''Preserve the cache as persistent files on the disk
+    def preserve(self, cache_path):
+        '''Preserve the cache as persistent file on the disk
 
-        Once the cache is preserved, cache files will not be removed
-        at cache close. To read data from preserved files, use
+        Once the cache is preserved, the cache file will not be removed
+        at cache close. To read data from preserved file, use
         ``preload()`` method. After preservation, no data can be added
-        to the cache.  ``name`` is the prefix of the persistent
-        files.
+        to the cache.  ``cache_path`` is the path to the persistent file.
 
         Be noted that ``preserve()`` can be called only by the master process
         i.e., the process where ``__init__()`` is called,
@@ -347,22 +346,22 @@ class MultiprocessFileCache(cache.Cache):
         if self._master_pid != os.getpid():
             raise RuntimeError("Cannot preserve a cache in a worker process")
 
-        if os.path.exists(name):
+        if os.path.exists(cache_path):
             if self.verbose:
                 print('Specified cache named "{}" already exists'
-                      .format(name))
+                      .format(cache_path))
             return False
 
         self._open_fds()
         try:
             fcntl.flock(self.cache_fd, fcntl.LOCK_EX)
-            os.link(self.cache_file.name, name)
+            os.link(self.cache_file.name, cache_path)
 
         except OSError as ose:
             if ose.errno in (errno.EPERM, errno.EXDEV):
                 # Hard link operation not permitted or cross device error
                 # -> fallback to copy
-                shutil.copyfile(self.cache_file.name, name)
+                shutil.copyfile(self.cache_file.name, cache_path)
 
             # Lock acquisition error -> No problem, since other worker
             # should be already working on it

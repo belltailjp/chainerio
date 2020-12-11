@@ -81,7 +81,7 @@ class DummyLock:
 class FileCache(cache.Cache):
     '''Cache system with local filesystem
 
-    Stores cache data in local temporary files, created in
+    Stores cache data in a local temporary file created in
     ``~/.pfio/cache`` by default. Cache data is
     automatically deleted after the object is collected. When this
     object is not correctly closed, (e.g., the process killed by
@@ -256,13 +256,13 @@ class FileCache(cache.Cache):
                 self.cachefp.close()
                 self.cachefp = None
 
-    def preload(self, name):
+    def preload(self, cache_path):
         '''Load the cache saved by ``preserve()``
 
-        After loading the files, no data can be added to the cache.
-        ``name`` is the prefix of the persistent files. To use cache
+        ``cache_path`` is the path to the persistent file. To use cache
         in ``multiprocessing`` environment, call this method at every
         forked process, except the process that called ``preserve()``.
+        After the preload, no data can be added to the cache.
 
         Returns:
             bool: Returns True if succeed.
@@ -274,30 +274,30 @@ class FileCache(cache.Cache):
             if self.verbose:
                 print("Failed to preload the cache from {}: "
                       "The cache is already frozen."
-                      .format(name))
+                      .format(cache_path))
             return False
 
-        if not os.path.exists(name):
+        if not os.path.exists(cache_path):
             if self.verbose:
                 print('Failed to ploread the cache from {}: '
-                      'The specified cache not found in {}'
-                      .format(name, self.dir))
+                      'The specified cache not found'
+                      .format(cache_path))
             return False
 
         with self.lock.wrlock():
             self.cachefp.close()
-            self.cachefp = open(name, 'rb')
+            self.cachefp = open(cache_path, 'rb')
             self._frozen = True
         return True
 
-    def preserve(self, name):
-        '''Preserve the cache as persistent files on the disk
+    def preserve(self, cache_path):
+        '''Preserve the cache as a persistent file on the disk
 
-        Once the cache is preserved, cache files will not be removed
-        at cache close. To read data from preserved files, use
+        Saves the current cache into ``cache_path``.
+        Once the cache is preserved, the cache file will not be removed
+        at cache close. To read data from the preserved file, use
         ``preload()`` method. After preservation, no data can be added
-        to the cache.  ``name`` is the prefix of the persistent
-        files.
+        to the cache.
 
         The preserved cache can also be preloaded by
         :class:`~MultiprocessFileCache`.
@@ -309,22 +309,22 @@ class FileCache(cache.Cache):
 
         '''
 
-        if os.path.exists(name):
+        if os.path.exists(cache_path):
             if self.verbose:
-                print('Specified cache named "{}" already exists in {}'
-                      .format(name, self.dir))
+                print('Specified cache named "{}" already exists'
+                      .format(cache_path))
             return False
 
         with self.lock.wrlock():
             try:
-                os.link(self.cachefp.name, name)
+                os.link(self.cachefp.name, cache_path)
             except OSError as ose:
                 if ose.errno in (errno.EPERM, errno.EXDEV):
                     # Hard link operation not permitted or cross device error
                     # -> fallback to copy
-                    shutil.copyfile(self.cachefp.name, name)
+                    shutil.copyfile(self.cachefp.name, cache_path)
 
             self.cachefp.close()
-            self.cachefp = open(name, 'rb')
+            self.cachefp = open(cache_path, 'rb')
             self._frozen = True
         return True
