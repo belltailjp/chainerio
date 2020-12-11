@@ -1,4 +1,6 @@
+import errno
 import os
+import shutil
 from struct import pack, unpack, calcsize
 import threading
 import tempfile
@@ -109,14 +111,14 @@ class FileCache(cache.Cache):
         self._multithread_safe = multithread_safe
         self.length = length
         self.do_pickle = do_pickle
-        assert self.length > 0
+        if self.length <= 0 or (2 ** 64) <= self.length:
+            raise ValueError("length has to be between 0 and 2^64")
 
         if self.multithread_safe:
             self.lock = RWLock()
         else:
             self.lock = DummyLock()
 
-        self.pos = 0
         if dir is None:
             self.dir = _DEFAULT_CACHE_PATH
         else:
@@ -124,23 +126,22 @@ class FileCache(cache.Cache):
         os.makedirs(self.dir, exist_ok=True)
 
         self.closed = False
-        self.indexfp = tempfile.NamedTemporaryFile(delete=True, dir=self.dir)
-        self.datafp = tempfile.NamedTemporaryFile(delete=True, dir=self.dir)
+        self.cachefp = tempfile.NamedTemporaryFile(delete=True, dir=self.dir)
 
-        # allocate space to store 2n 64bit unsigned integers
-        # 16 bytes * n chunks
-        # Size must be smaller than max value of signed long long
+        # allocate space to store 2n uint64 index buffer filled by -1.
+        # the cache data will be appended after the indices.
         buf = pack('Qq', 0, -1)
         self.buflen = calcsize('Qq')
         assert self.buflen == 16
         for i in range(self.length):
             offset = self.buflen * i
-            r = os.pwrite(self.indexfp.fileno(), buf, offset)
+            r = os.pwrite(self.cachefp.fileno(), buf, offset)
             assert r == self.buflen
+        self.pos = self.buflen * self.length
+
         self.verbose = verbose
         if self.verbose:
-            print('created index file:', self.indexfp.name)
-            print('created data file:', self.datafp.name)
+            print('created cache file:', self.cachefp.name)
 
         self._frozen = False
 
@@ -153,8 +154,7 @@ class FileCache(cache.Cache):
 
     @property
     def multiprocess_safe(self):
-        # If it's preseved/preloaded, then the file contents are
-        # fixed.
+        # If it's preseved/preloaded, then the file contents are fixed.
         return self._frozen
 
     @property
@@ -173,12 +173,12 @@ class FileCache(cache.Cache):
         assert i >= 0 and i < self.length
         offset = self.buflen * i
         with self.lock.rdlock():
-            buf = os.pread(self.indexfp.fileno(), self.buflen, offset)
+            buf = os.pread(self.cachefp.fileno(), self.buflen, offset)
             (o, l) = unpack('Qq', buf)
             if l < 0 or o < 0:
                 return None
 
-            data = os.pread(self.datafp.fileno(), l, o)
+            data = os.pread(self.cachefp.fileno(), l, o)
             assert len(data) == l
             return data
 
@@ -191,7 +191,7 @@ class FileCache(cache.Cache):
 
         except OSError as ose:
             # Disk full (ENOSPC) possibly by cache; just warn and keep running
-            if ose.errno == 28:
+            if ose.errno == errno.ENOSPC:
                 warnings.warn(ose.strerror, RuntimeWarning)
                 return False
             else:
@@ -204,7 +204,7 @@ class FileCache(cache.Cache):
         offset = self.buflen * i
 
         with self.lock.wrlock():
-            buf = os.pread(self.indexfp.fileno(), self.buflen, offset)
+            buf = os.pread(self.cachefp.fileno(), self.buflen, offset)
             (o, l) = unpack('Qq', buf)
             if l >= 0 and o >= 0:
                 # Already data exists
@@ -229,12 +229,12 @@ class FileCache(cache.Cache):
 
             '''
             buf = pack('Qq', pos, len(data))
-            r = os.pwrite(self.indexfp.fileno(), buf, offset)
+            r = os.pwrite(self.cachefp.fileno(), buf, offset)
             assert r == self.buflen
 
             current_pos = pos
             while current_pos - pos < len(data):
-                r = os.pwrite(self.datafp.fileno(),
+                r = os.pwrite(self.cachefp.fileno(),
                               data[current_pos-pos:], current_pos)
                 assert r > 0
                 current_pos += r
@@ -253,10 +253,8 @@ class FileCache(cache.Cache):
         with self.lock.wrlock():
             if not self.closed:
                 self.closed = True
-                self.indexfp.close()
-                self.datafp.close()
-                self.indexfp = None
-                self.datafp = None
+                self.cachefp.close()
+                self.cachefp = None
 
     def preload(self, name):
         '''Load the cache saved by ``preserve()``
@@ -279,10 +277,7 @@ class FileCache(cache.Cache):
                       .format(name))
             return False
 
-        indexfile = os.path.join(self.dir, '{}.cachei'.format(name))
-        datafile = os.path.join(self.dir, '{}.cached'.format(name))
-
-        if any(not os.path.exists(p) for p in (indexfile, datafile)):
+        if not os.path.exists(name):
             if self.verbose:
                 print('Failed to ploread the cache from {}: '
                       'The specified cache not found in {}'
@@ -290,12 +285,8 @@ class FileCache(cache.Cache):
             return False
 
         with self.lock.wrlock():
-            # Hard link and save them
-            self.indexfp.close()
-            self.datafp.close()
-
-            self.indexfp = open(indexfile, 'rb')
-            self.datafp = open(datafile, 'rb')
+            self.cachefp.close()
+            self.cachefp = open(name, 'rb')
             self._frozen = True
         return True
 
@@ -318,23 +309,22 @@ class FileCache(cache.Cache):
 
         '''
 
-        indexfile = os.path.join(self.dir, '{}.cachei'.format(name))
-        datafile = os.path.join(self.dir, '{}.cached'.format(name))
-
-        if any(os.path.exists(p) for p in (indexfile, datafile)):
+        if os.path.exists(name):
             if self.verbose:
                 print('Specified cache named "{}" already exists in {}'
                       .format(name, self.dir))
             return False
 
         with self.lock.wrlock():
-            # Hard link and save them
-            os.link(self.indexfp.name, indexfile)
-            os.link(self.datafp.name, datafile)
-            self.indexfp.close()
-            self.datafp.close()
+            try:
+                os.link(self.cachefp.name, name)
+            except OSError as ose:
+                if ose.errno in (errno.EPERM, errno.EXDEV):
+                    # Hard link operation not permitted or cross device error
+                    # -> fallback to copy
+                    shutil.copyfile(self.cachefp.name, name)
 
-            self.indexfp = open(indexfile, 'rb')
-            self.datafp = open(datafile, 'rb')
+            self.cachefp.close()
+            self.cachefp = open(name, 'rb')
             self._frozen = True
         return True

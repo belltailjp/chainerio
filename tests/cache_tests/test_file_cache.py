@@ -39,7 +39,7 @@ def test_preservation():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert cache.preserve('preserved') is True
+        assert cache.preserve(os.path.join(d, 'preserved')) is True
 
         for i in range(10):
             assert str(i) == cache.get(i)
@@ -49,7 +49,7 @@ def test_preservation():
         # Imitating a new process, fresh load
         cache2 = FileCache(10, dir=d, do_pickle=True)
 
-        assert cache2.preload('preserved') is True
+        assert cache2.preload(os.path.join(d, 'preserved')) is True
         for i in range(10):
             assert str(i) == cache2.get(i)
 
@@ -61,9 +61,9 @@ def test_preservation_error_already_exists():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert cache.preserve('preserved') is True
+        assert cache.preserve(os.path.join(d, 'preserved')) is True
 
-        assert cache.preserve('preserved') is False
+        assert cache.preserve(os.path.join(d, 'preserved')) is False
 
         cache.close()
 
@@ -72,7 +72,7 @@ def test_preload_error_not_found():
     with tempfile.TemporaryDirectory() as d:
         cache = FileCache(10, dir=d, do_pickle=True)
 
-        assert cache.preload('preserved') is False
+        assert cache.preload(os.path.join(d, 'preserved')) is False
 
         cache.close()
 
@@ -84,7 +84,7 @@ def test_preservation_interoperability():
         for i in range(10):
             cache.put(i, str(i))
 
-        assert cache.preserve('preserved') is True
+        assert cache.preserve(os.path.join(d, 'preserved')) is True
 
         for i in range(10):
             assert str(i) == cache.get(i)
@@ -93,6 +93,6 @@ def test_preservation_interoperability():
 
         cache2 = MultiprocessFileCache(10, dir=d, do_pickle=True)
 
-        assert cache2.preload('preserved') is True
+        assert cache2.preload(os.path.join(d, 'preserved')) is True
         for i in range(10):
             assert str(i) == cache2.get(i)
